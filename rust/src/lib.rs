@@ -4,6 +4,9 @@
 // panicking across `extern "C"`. Panics are caught at the boundary with `catch_unwind`.
 // The message of the most recent failure on the calling thread is available through
 // `tokenizers_get_last_error`.
+//
+// v0.1.4: adds `tokenizers_encode_batch_truncated` (HF truncation applied inside Rust, before
+// the post-processor adds special tokens). Purely additive.
 use ahash::AHashMap;
 use serde_json::Value;
 use std::cell::RefCell;
@@ -12,7 +15,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::str::FromStr;
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
-use tokenizers::tokenizer::Tokenizer;
+use tokenizers::tokenizer::{
+    PostProcessor, Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
+};
 
 pub const TOKENIZERS_OK: i32 = 0;
 pub const TOKENIZERS_ERR_NULL_ARG: i32 = -1;
@@ -255,6 +260,51 @@ impl TokenizerWrapper {
             .collect())
     }
 
+    /// Batch encode with HF truncation to `max_length` tokens (special tokens included).
+    /// The tokenizer's own truncation config is restored on every path (a drop guard also
+    /// covers unwinding).
+    fn encode_batch_truncated(
+        &mut self,
+        texts: Vec<&str>,
+        add_special_tokens: bool,
+        max_length: usize,
+    ) -> CResult<Vec<Vec<u32>>> {
+        let n_added = self
+            .tokenizer
+            .get_post_processor()
+            .map_or(0, |pp| pp.added_tokens(false));
+        // tokenizers 0.21.4 computes `max_length - n_added` in unchecked usize arithmetic, in
+        // `with_truncation` and in `post_process` (when special tokens are added). In a release
+        // build that wraps to a huge limit, so the item comes back untruncated; Python
+        // tokenizers 0.22.2 returns the same. With overflow checks on (debug/test builds) it
+        // would panic instead. Produce the release/Python result explicitly so builds agree.
+        let params = if add_special_tokens && max_length < n_added {
+            None
+        } else {
+            Some(TruncationParams {
+                direction: TruncationDirection::Right,
+                max_length,
+                strategy: TruncationStrategy::LongestFirst,
+                stride: 0,
+            })
+        };
+        let saved = self.tokenizer.get_truncation().cloned();
+        let mut guard = TruncationRestore {
+            tokenizer: &mut self.tokenizer,
+            saved: Some(saved),
+        };
+        set_truncation(guard.tokenizer, params)?;
+        let encoded = guard
+            .tokenizer
+            .encode_batch(texts, add_special_tokens)
+            .map_err(|e| tok_err("encode_batch failed", e))?;
+        guard.restore()?;
+        Ok(encoded
+            .into_iter()
+            .map(|enc| enc.get_ids().to_vec())
+            .collect())
+    }
+
     fn decode(&mut self, ids: &[u32], skip_special_tokens: bool) -> CResult<()> {
         self.decode_str.clear();
         let s = self
@@ -263,6 +313,64 @@ impl TokenizerWrapper {
             .map_err(|e| tok_err("decode failed", e))?;
         self.decode_str = s;
         Ok(())
+    }
+}
+
+/// Sets the tokenizer's truncation without running the crate's `with_truncation` check on
+/// `params` itself: that check computes `max_length - n_added` unchecked (it overflows for a
+/// small `max_length`) and only rejects a `stride` too large for the effective length, which
+/// cannot happen with our stride 0. `with_truncation` is still called (with a seed that always
+/// validates) and its `Err` maps to ERR_TOKENIZER. Also used to restore the saved config
+/// verbatim, whatever tokenizer.json put there.
+fn set_truncation(tokenizer: &mut Tokenizer, params: Option<TruncationParams>) -> CResult<()> {
+    let params = match params {
+        None => {
+            tokenizer
+                .with_truncation(None)
+                .map_err(|e| tok_err("with_truncation failed", e))?;
+            return Ok(());
+        }
+        Some(p) => p,
+    };
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            direction: params.direction,
+            max_length: usize::MAX,
+            strategy: params.strategy,
+            stride: 0,
+        }))
+        .map_err(|e| tok_err("with_truncation failed", e))?;
+    match tokenizer.get_truncation_mut() {
+        Some(t) => {
+            *t = params;
+            Ok(())
+        }
+        None => Err(CError::new(
+            TOKENIZERS_ERR_TOKENIZER,
+            "with_truncation did not store the truncation params",
+        )),
+    }
+}
+
+/// Restores the saved truncation config when dropped (including on unwind). `restore` does it
+/// explicitly on the success path so a failure there can be reported.
+struct TruncationRestore<'a> {
+    tokenizer: &'a mut Tokenizer,
+    saved: Option<Option<TruncationParams>>,
+}
+
+impl<'a> TruncationRestore<'a> {
+    fn restore(&mut self) -> CResult<()> {
+        match self.saved.take() {
+            Some(saved) => set_truncation(self.tokenizer, saved),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'a> Drop for TruncationRestore<'a> {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 
@@ -332,6 +440,62 @@ extern "C" fn tokenizers_encode(
     })
 }
 
+/// Shared body of `tokenizers_encode_batch` and `tokenizers_encode_batch_truncated`.
+/// `max_length == 0` means no truncation: the plain encode_batch path, config untouched.
+unsafe fn encode_batch_impl(
+    handle: *mut TokenizerWrapper,
+    input_cstr: *const *const u8,
+    input_len: *const usize,
+    num_seqs: usize,
+    add_special_tokens: i32,
+    max_length: usize,
+    out_result: *mut TokenizerEncodeResult,
+) -> CResult<()> {
+    let wrapper = handle_mut(handle)?;
+    if num_seqs == 0 {
+        return Ok(());
+    }
+    if out_result.is_null() {
+        return Err(null_arg("results"));
+    }
+    let outs = std::slice::from_raw_parts_mut(out_result, num_seqs);
+    for o in outs.iter_mut() {
+        *o = EMPTY_RESULT;
+    }
+    if input_cstr.is_null() {
+        return Err(null_arg("data"));
+    }
+    if input_len.is_null() {
+        return Err(null_arg("len"));
+    }
+    let ptrs = std::slice::from_raw_parts(input_cstr, num_seqs);
+    let lens = std::slice::from_raw_parts(input_len, num_seqs);
+    let mut texts: Vec<&str> = Vec::with_capacity(num_seqs);
+    for (i, (&p, &n)) in ptrs.iter().zip(lens.iter()).enumerate() {
+        texts.push(strict_str(p, n, &format!("data[{}]", i))?);
+    }
+    let encoded = if max_length == 0 {
+        wrapper.encode_batch(texts, add_special_tokens != 0)?
+    } else {
+        wrapper.encode_batch_truncated(texts, add_special_tokens != 0, max_length)?
+    };
+    if encoded.len() != num_seqs {
+        return Err(CError::new(
+            TOKENIZERS_ERR_TOKENIZER,
+            format!(
+                "encode_batch returned {} results for {} inputs",
+                encoded.len(),
+                num_seqs
+            ),
+        ));
+    }
+    // Nothing below can fail, so no partial allocations are left on error.
+    for (o, ids) in outs.iter_mut().zip(encoded.into_iter()) {
+        *o = into_result(ids);
+    }
+    Ok(())
+}
+
 #[no_mangle]
 extern "C" fn tokenizers_encode_batch(
     handle: *mut TokenizerWrapper,
@@ -342,45 +506,38 @@ extern "C" fn tokenizers_encode_batch(
     out_result: *mut TokenizerEncodeResult,
 ) -> i32 {
     guard_status(|| unsafe {
-        let wrapper = handle_mut(handle)?;
-        if num_seqs == 0 {
-            return Ok(());
-        }
-        if out_result.is_null() {
-            return Err(null_arg("results"));
-        }
-        let outs = std::slice::from_raw_parts_mut(out_result, num_seqs);
-        for o in outs.iter_mut() {
-            *o = EMPTY_RESULT;
-        }
-        if input_cstr.is_null() {
-            return Err(null_arg("data"));
-        }
-        if input_len.is_null() {
-            return Err(null_arg("len"));
-        }
-        let ptrs = std::slice::from_raw_parts(input_cstr, num_seqs);
-        let lens = std::slice::from_raw_parts(input_len, num_seqs);
-        let mut texts: Vec<&str> = Vec::with_capacity(num_seqs);
-        for (i, (&p, &n)) in ptrs.iter().zip(lens.iter()).enumerate() {
-            texts.push(strict_str(p, n, &format!("data[{}]", i))?);
-        }
-        let encoded = wrapper.encode_batch(texts, add_special_tokens != 0)?;
-        if encoded.len() != num_seqs {
-            return Err(CError::new(
-                TOKENIZERS_ERR_TOKENIZER,
-                format!(
-                    "encode_batch returned {} results for {} inputs",
-                    encoded.len(),
-                    num_seqs
-                ),
-            ));
-        }
-        // Nothing below can fail, so no partial allocations are left on error.
-        for (o, ids) in outs.iter_mut().zip(encoded.into_iter()) {
-            *o = into_result(ids);
-        }
-        Ok(())
+        encode_batch_impl(
+            handle,
+            input_cstr,
+            input_len,
+            num_seqs,
+            add_special_tokens,
+            0,
+            out_result,
+        )
+    })
+}
+
+#[no_mangle]
+extern "C" fn tokenizers_encode_batch_truncated(
+    handle: *mut TokenizerWrapper,
+    input_cstr: *const *const u8,
+    input_len: *const usize,
+    num_seqs: usize,
+    add_special_tokens: i32,
+    max_length: usize,
+    out_result: *mut TokenizerEncodeResult,
+) -> i32 {
+    guard_status(|| unsafe {
+        encode_batch_impl(
+            handle,
+            input_cstr,
+            input_len,
+            num_seqs,
+            add_special_tokens,
+            max_length,
+            out_result,
+        )
     })
 }
 

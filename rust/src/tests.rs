@@ -428,3 +428,307 @@ fn success_leaves_last_error_unchanged() {
     assert_eq!(last_error(), before);
     tokenizers_free(h);
 }
+
+// ---- v0.1.4: tokenizers_encode_batch_truncated ----
+
+// WordLevel with [CLS]=3 / [SEP]=4 and the template "[CLS] $A [SEP]". `truncation` is the raw
+// JSON value of the tokenizer's own truncation config.
+fn bert_json(truncation: &str) -> String {
+    format!(
+        r#"{{
+  "version": "1.0",
+  "truncation": {},
+  "padding": null,
+  "added_tokens": [
+    {{"id": 3, "content": "[CLS]", "single_word": false, "lstrip": false, "rstrip": false,
+     "normalized": false, "special": true}},
+    {{"id": 4, "content": "[SEP]", "single_word": false, "lstrip": false, "rstrip": false,
+     "normalized": false, "special": true}}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {{"type": "Whitespace"}},
+  "post_processor": {{
+    "type": "TemplateProcessing",
+    "single": [
+      {{"SpecialToken": {{"id": "[CLS]", "type_id": 0}}}},
+      {{"Sequence": {{"id": "A", "type_id": 0}}}},
+      {{"SpecialToken": {{"id": "[SEP]", "type_id": 0}}}}
+    ],
+    "pair": [
+      {{"SpecialToken": {{"id": "[CLS]", "type_id": 0}}}},
+      {{"Sequence": {{"id": "A", "type_id": 0}}}},
+      {{"SpecialToken": {{"id": "[SEP]", "type_id": 0}}}},
+      {{"Sequence": {{"id": "B", "type_id": 1}}}},
+      {{"SpecialToken": {{"id": "[SEP]", "type_id": 1}}}}
+    ],
+    "special_tokens": {{
+      "[CLS]": {{"id": "[CLS]", "ids": [3], "tokens": ["[CLS]"]}},
+      "[SEP]": {{"id": "[SEP]", "ids": [4], "tokens": ["[SEP]"]}}
+    }}
+  }},
+  "decoder": null,
+  "model": {{
+    "type": "WordLevel",
+    "vocab": {{"[UNK]": 0, "hello": 1, "world": 2, "[CLS]": 3, "[SEP]": 4}},
+    "unk_token": "[UNK]"
+  }}
+}}"#,
+        truncation
+    )
+}
+
+const TRUNC3: &str =
+    r#"{"direction":"Right","max_length":3,"strategy":"LongestFirst","stride":0}"#;
+
+fn make_bert(truncation: &str) -> *mut TokenizerWrapper {
+    let json = bert_json(truncation);
+    let h = tokenizers_new_from_str(json.as_ptr(), json.len());
+    assert!(!h.is_null(), "bert JSON must give a handle: {}", last_error());
+    h
+}
+
+const INPUTS: [&[u8]; 4] = [
+    b"hello world hello world",
+    b"hello",
+    b"",
+    b"world world world world world",
+];
+
+fn garbage() -> TokenizerEncodeResult {
+    TokenizerEncodeResult {
+        token_ids: 0x1 as *mut u32,
+        len: 5,
+    }
+}
+
+// Runs the truncated batch encode; returns the status, the ids and whether every result was
+// {NULL,0}. Results are freed.
+fn trunc_batch(
+    h: *mut TokenizerWrapper,
+    items: &[&[u8]],
+    special: i32,
+    max_length: usize,
+) -> (i32, Vec<Vec<u32>>, bool) {
+    let ptrs: Vec<*const u8> = items.iter().map(|s| s.as_ptr()).collect();
+    let lens: Vec<usize> = items.iter().map(|s| s.len()).collect();
+    let mut res: Vec<TokenizerEncodeResult> = items.iter().map(|_| garbage()).collect();
+    let st = tokenizers_encode_batch_truncated(
+        h,
+        ptrs.as_ptr(),
+        lens.as_ptr(),
+        items.len(),
+        special,
+        max_length,
+        res.as_mut_ptr(),
+    );
+    let all_empty = res.iter().all(is_empty);
+    let ids = res.iter().map(ids_of).collect();
+    tokenizers_free_encode_results(res.as_mut_ptr(), res.len());
+    (st, ids, all_empty)
+}
+
+fn plain_batch(h: *mut TokenizerWrapper, items: &[&[u8]], special: i32) -> (i32, Vec<Vec<u32>>) {
+    let ptrs: Vec<*const u8> = items.iter().map(|s| s.as_ptr()).collect();
+    let lens: Vec<usize> = items.iter().map(|s| s.len()).collect();
+    let mut res: Vec<TokenizerEncodeResult> = items.iter().map(|_| garbage()).collect();
+    let st = tokenizers_encode_batch(
+        h,
+        ptrs.as_ptr(),
+        lens.as_ptr(),
+        items.len(),
+        special,
+        res.as_mut_ptr(),
+    );
+    let ids = res.iter().map(ids_of).collect();
+    tokenizers_free_encode_results(res.as_mut_ptr(), res.len());
+    (st, ids)
+}
+
+fn plain_ids(h: *mut TokenizerWrapper, text: &[u8], special: i32) -> Vec<u32> {
+    let (st, mut r) = encode(h, text, special);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    let ids = ids_of(&r);
+    tokenizers_free_encode_results(&mut r, 1);
+    ids
+}
+
+// T1-T3: expected values from Python tokenizers 0.22.2 (computed by the lead)
+#[test]
+fn truncated_values() {
+    let h = make_bert("null");
+    let cases: [(usize, i32, Vec<Vec<u32>>); 5] = [
+        (4, 1, vec![vec![3, 1, 2, 4], vec![3, 1, 4], vec![3, 4], vec![3, 2, 2, 4]]),
+        (4, 0, vec![vec![1, 2, 1, 2], vec![1], vec![], vec![2, 2, 2, 2]]),
+        (3, 1, vec![vec![3, 1, 4], vec![3, 1, 4], vec![3, 4], vec![3, 2, 4]]),
+        (2, 1, vec![vec![3, 4], vec![3, 4], vec![3, 4], vec![3, 4]]),
+        (2, 0, vec![vec![1, 2], vec![1], vec![], vec![2, 2]]),
+    ];
+    for (max_length, special, expected) in cases.iter() {
+        let (st, ids, _) = trunc_batch(h, &INPUTS, *special, *max_length);
+        assert_eq!(st, TOKENIZERS_OK, "max_length {}: {}", max_length, last_error());
+        assert_eq!(&ids, expected, "max_length {} special {}", max_length, special);
+    }
+    // An empty item is {NULL,0}.
+    let ptrs = [b"".as_ptr()];
+    let lens = [0usize];
+    let mut res = [garbage()];
+    let st = tokenizers_encode_batch_truncated(
+        h,
+        ptrs.as_ptr(),
+        lens.as_ptr(),
+        1,
+        0,
+        4,
+        res.as_mut_ptr(),
+    );
+    assert_eq!(st, TOKENIZERS_OK);
+    assert!(is_empty(&res[0]));
+    tokenizers_free(h);
+}
+
+// T4: max_length smaller than the added special tokens. Python returns the items untruncated.
+#[test]
+fn truncated_below_special_count() {
+    let h = make_bert("null");
+    let (st, ids, all_empty) = trunc_batch(h, &INPUTS, 1, 1);
+    assert_ne!(st, TOKENIZERS_ERR_PANIC, "{}", last_error());
+    if st == TOKENIZERS_OK {
+        assert_eq!(
+            ids,
+            vec![
+                vec![3, 1, 2, 1, 2, 4],
+                vec![3, 1, 4],
+                vec![3, 4],
+                vec![3, 2, 2, 2, 2, 2, 4]
+            ]
+        );
+    } else {
+        assert_eq!(st, TOKENIZERS_ERR_TOKENIZER, "{}", last_error());
+        assert!(all_empty);
+    }
+    // The handle is still usable and untruncated afterwards.
+    assert_eq!(plain_ids(h, b"hello world hello world", 1), vec![3, 1, 2, 1, 2, 4]);
+    // Specials off with max_length 1: plain truncation to 1 token.
+    let (st, ids, _) = trunc_batch(h, &INPUTS, 0, 1);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![1], vec![1], vec![], vec![2]]);
+    tokenizers_free(h);
+}
+
+// Documents why encode_batch_truncated does not hand max_length < n_added to the crate
+// directly: tokenizers 0.21.4 computes `max_length - n_added` unchecked, which panics with
+// overflow checks on (test/debug builds) and wraps (= no truncation) in release.
+#[test]
+fn crate_raw_small_max_length_overflows_in_debug() {
+    let json = bert_json("null");
+    let mut tok = match Tokenizer::from_str(&json) {
+        Ok(t) => t,
+        Err(e) => panic!("{}", e),
+    };
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        tok.with_truncation(Some(TruncationParams {
+            direction: TruncationDirection::Right,
+            max_length: 1,
+            strategy: TruncationStrategy::LongestFirst,
+            stride: 0,
+        }))
+        .is_ok()
+    }));
+    if cfg!(debug_assertions) {
+        assert!(r.is_err(), "expected the crate's usize underflow to panic in a debug build");
+    } else {
+        assert_eq!(r.ok(), Some(true));
+    }
+}
+
+// T5: max_length 0 is identical to tokenizers_encode_batch
+#[test]
+fn truncated_zero_is_plain_batch() {
+    let h = make_bert("null");
+    for special in [0, 1].iter() {
+        let (st_t, ids_t, _) = trunc_batch(h, &INPUTS, *special, 0);
+        let (st_p, ids_p) = plain_batch(h, &INPUTS, *special);
+        assert_eq!(st_t, TOKENIZERS_OK);
+        assert_eq!(st_p, TOKENIZERS_OK);
+        assert_eq!(ids_t, ids_p);
+    }
+    tokenizers_free(h);
+
+    // With the handle's own truncation: max_length 0 leaves it in effect.
+    let h = make_bert(TRUNC3);
+    let (_, ids_t, _) = trunc_batch(h, &INPUTS, 1, 0);
+    let (_, ids_p) = plain_batch(h, &INPUTS, 1);
+    assert_eq!(ids_t, ids_p);
+    assert_eq!(ids_t[0], vec![3, 1, 4]);
+    tokenizers_free(h);
+}
+
+// T6: the handle's own truncation config is restored
+#[test]
+fn truncated_restores_config() {
+    let h = make_bert(TRUNC3);
+    let text: &[u8] = b"hello world hello world";
+    assert_eq!(plain_ids(h, text, 1), vec![3, 1, 4]);
+    let (st, ids, _) = trunc_batch(h, &[text], 1, 6);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![3, 1, 2, 1, 2, 4]]);
+    assert_eq!(plain_ids(h, text, 1), vec![3, 1, 4]);
+    // also after the below-special-count path
+    let _ = trunc_batch(h, &[text], 1, 1);
+    assert_eq!(plain_ids(h, text, 1), vec![3, 1, 4]);
+    tokenizers_free(h);
+
+    let h = make_bert("null");
+    let (st, ids, _) = trunc_batch(h, &[text], 1, 3);
+    assert_eq!(st, TOKENIZERS_OK);
+    assert_eq!(ids, vec![vec![3, 1, 4]]);
+    assert_eq!(plain_ids(h, text, 1), vec![3, 1, 2, 1, 2, 4]);
+    tokenizers_free(h);
+}
+
+// T7: a failing call restores the config too
+#[test]
+fn truncated_failure_restores_config() {
+    let h = make_bert(TRUNC3);
+    let bad: [&[u8]; 3] = [b"hello world hello world", &[0xFF], b"world"];
+    let (st, _, all_empty) = trunc_batch(h, &bad, 1, 6);
+    assert_eq!(st, TOKENIZERS_ERR_INVALID_UTF8);
+    assert!(all_empty);
+    assert!(!last_error().is_empty());
+    assert_eq!(plain_ids(h, b"hello world hello world", 1), vec![3, 1, 4]);
+    tokenizers_free(h);
+}
+
+// T8: NULL handle and num_seqs == 0, NULL arrays
+#[test]
+fn truncated_null_args() {
+    assert_eq!(
+        tokenizers_encode_batch_truncated(null_mut(), null(), null(), 0, 1, 4, null_mut()),
+        TOKENIZERS_ERR_NULL_ARG
+    );
+    assert!(last_error().contains("handle"));
+    let h = make_bert("null");
+    assert_eq!(
+        tokenizers_encode_batch_truncated(h, null(), null(), 0, 1, 4, null_mut()),
+        TOKENIZERS_OK
+    );
+    let ptrs = [b"hello".as_ptr()];
+    let lens = [5usize];
+    let mut res = [garbage()];
+    assert_eq!(
+        tokenizers_encode_batch_truncated(h, null(), lens.as_ptr(), 1, 1, 4, res.as_mut_ptr()),
+        TOKENIZERS_ERR_NULL_ARG
+    );
+    assert!(is_empty(&res[0]));
+    let mut res = [garbage()];
+    assert_eq!(
+        tokenizers_encode_batch_truncated(h, ptrs.as_ptr(), null(), 1, 1, 4, res.as_mut_ptr()),
+        TOKENIZERS_ERR_NULL_ARG
+    );
+    assert!(is_empty(&res[0]));
+    assert_eq!(
+        tokenizers_encode_batch_truncated(h, ptrs.as_ptr(), lens.as_ptr(), 1, 1, 4, null_mut()),
+        TOKENIZERS_ERR_NULL_ARG
+    );
+    tokenizers_free(h);
+}
