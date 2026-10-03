@@ -7,6 +7,11 @@
 //
 // v0.1.4: adds `tokenizers_encode_batch_truncated` (HF truncation applied inside Rust, before
 // the post-processor adds special tokens). Purely additive.
+//
+// v0.1.5: the encode entry points never apply the tokenizer.json `padding` block. The C API
+// returns only ids, so callers could not tell pad ids from real tokens. Each encode clears the
+// handle's padding and restores it before returning (see `ConfigRestore`), like Python callers
+// that use `Tokenizer.no_padding()`. Truncation behaviour is unchanged.
 use ahash::AHashMap;
 use serde_json::Value;
 use std::cell::RefCell;
@@ -16,7 +21,8 @@ use std::str::FromStr;
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::tokenizer::{
-    PostProcessor, Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
+    PaddingParams, PostProcessor, Tokenizer, TruncationDirection, TruncationParams,
+    TruncationStrategy,
 };
 
 pub const TOKENIZERS_OK: i32 = 0;
@@ -237,32 +243,40 @@ impl TokenizerWrapper {
         })
     }
 
+    /// Encodes with the handle's padding disabled (restored on every path); the handle's own
+    /// truncation stays in effect.
     fn encode(&mut self, text: &str, add_special_tokens: bool) -> CResult<Vec<u32>> {
-        let encoded = self
+        let mut guard = ConfigRestore::without_padding(&mut self.tokenizer);
+        let encoded = guard
             .tokenizer
             .encode(text, add_special_tokens)
             .map_err(|e| tok_err("encode failed", e))?;
+        guard.restore()?;
         Ok(encoded.get_ids().to_vec())
     }
 
+    /// Batch encode with the handle's padding disabled (restored on every path); the handle's
+    /// own truncation stays in effect.
     fn encode_batch(
         &mut self,
         texts: Vec<&str>,
         add_special_tokens: bool,
     ) -> CResult<Vec<Vec<u32>>> {
-        let encoded = self
+        let mut guard = ConfigRestore::without_padding(&mut self.tokenizer);
+        let encoded = guard
             .tokenizer
             .encode_batch(texts, add_special_tokens)
             .map_err(|e| tok_err("encode_batch failed", e))?;
+        guard.restore()?;
         Ok(encoded
             .into_iter()
             .map(|enc| enc.get_ids().to_vec())
             .collect())
     }
 
-    /// Batch encode with HF truncation to `max_length` tokens (special tokens included).
-    /// The tokenizer's own truncation config is restored on every path (a drop guard also
-    /// covers unwinding).
+    /// Batch encode with HF truncation to `max_length` tokens (special tokens included) and
+    /// padding disabled. The tokenizer's own truncation and padding config are restored on
+    /// every path (a drop guard also covers unwinding).
     fn encode_batch_truncated(
         &mut self,
         texts: Vec<&str>,
@@ -288,11 +302,8 @@ impl TokenizerWrapper {
                 stride: 0,
             })
         };
-        let saved = self.tokenizer.get_truncation().cloned();
-        let mut guard = TruncationRestore {
-            tokenizer: &mut self.tokenizer,
-            saved: Some(saved),
-        };
+        let mut guard = ConfigRestore::without_padding(&mut self.tokenizer);
+        guard.saved_truncation = Some(guard.tokenizer.get_truncation().cloned());
         set_truncation(guard.tokenizer, params)?;
         let encoded = guard
             .tokenizer
@@ -352,23 +363,42 @@ fn set_truncation(tokenizer: &mut Tokenizer, params: Option<TruncationParams>) -
     }
 }
 
-/// Restores the saved truncation config when dropped (including on unwind). `restore` does it
-/// explicitly on the success path so a failure there can be reported.
-struct TruncationRestore<'a> {
+/// Restores the handle's saved padding and truncation config when dropped (including on unwind
+/// out of a crate panic, which `guard_status` then catches). `restore` does it explicitly on the
+/// success path so a failure there can be reported. Each saved value is `Some` only if this
+/// guard changed that setting; `take()` makes restoring idempotent (the drop after an explicit
+/// `restore` is a no-op).
+struct ConfigRestore<'a> {
     tokenizer: &'a mut Tokenizer,
-    saved: Option<Option<TruncationParams>>,
+    saved_padding: Option<Option<PaddingParams>>,
+    saved_truncation: Option<Option<TruncationParams>>,
 }
 
-impl<'a> TruncationRestore<'a> {
+impl<'a> ConfigRestore<'a> {
+    /// Saves the handle's padding and clears it (`with_padding(None)` cannot fail).
+    fn without_padding(tokenizer: &'a mut Tokenizer) -> ConfigRestore<'a> {
+        let saved = tokenizer.get_padding().cloned();
+        tokenizer.with_padding(None);
+        ConfigRestore {
+            tokenizer,
+            saved_padding: Some(saved),
+            saved_truncation: None,
+        }
+    }
+
     fn restore(&mut self) -> CResult<()> {
-        match self.saved.take() {
+        // Padding first: it is infallible, so it is back even if the truncation restore fails.
+        if let Some(saved) = self.saved_padding.take() {
+            self.tokenizer.with_padding(saved);
+        }
+        match self.saved_truncation.take() {
             Some(saved) => set_truncation(self.tokenizer, saved),
             None => Ok(()),
         }
     }
 }
 
-impl<'a> Drop for TruncationRestore<'a> {
+impl<'a> Drop for ConfigRestore<'a> {
     fn drop(&mut self) {
         let _ = self.restore();
     }
@@ -441,7 +471,8 @@ extern "C" fn tokenizers_encode(
 }
 
 /// Shared body of `tokenizers_encode_batch` and `tokenizers_encode_batch_truncated`.
-/// `max_length == 0` means no truncation: the plain encode_batch path, config untouched.
+/// `max_length == 0` means no extra truncation: the plain encode_batch path (the handle's own
+/// truncation applies; padding is disabled on both paths).
 unsafe fn encode_batch_impl(
     handle: *mut TokenizerWrapper,
     input_cstr: *const *const u8,

@@ -732,3 +732,180 @@ fn truncated_null_args() {
     );
     tokenizers_free(h);
 }
+
+// ---- v0.1.5: the encode calls never apply the tokenizer.json padding ----
+// Expected ids from Python tokenizers 0.22.2 with Tokenizer.no_padding() on the same JSON
+// (computed once with the micromamba env and hardcoded). With padding on, Python returns e.g.
+// [3, 1, 2, 4, 7, 7, ...] (pad_id 7), so these tests do see the difference.
+
+const PAD_FIXED16: &str = r#"{"strategy":{"Fixed":16},"direction":"Right","pad_to_multiple_of":null,"pad_id":7,"pad_type_id":0,"pad_token":"[PAD]"}"#;
+const PAD_LONGEST8: &str = r#"{"strategy":"BatchLongest","direction":"Right","pad_to_multiple_of":8,"pad_id":7,"pad_type_id":0,"pad_token":"[PAD]"}"#;
+
+const PAD_TEXTS: [&[u8]; 3] = [
+    b"hello world hello world",
+    b"hello",
+    b"world world world world world",
+];
+
+fn make_padded(padding: &str, truncation: &str) -> *mut TokenizerWrapper {
+    let json = bert_json(truncation).replace(
+        "\"padding\": null",
+        &format!("\"padding\": {}", padding),
+    );
+    let h = tokenizers_new_from_str(json.as_ptr(), json.len());
+    assert!(!h.is_null(), "padded JSON must give a handle: {}", last_error());
+    h
+}
+
+/// The handle's padding config as JSON (PaddingParams has no PartialEq).
+fn padding_of(h: *mut TokenizerWrapper) -> serde_json::Value {
+    let tok = unsafe { &(*h).tokenizer };
+    match serde_json::to_value(tok.get_padding()) {
+        Ok(v) => v,
+        Err(e) => panic!("{}", e),
+    }
+}
+
+fn check_no_padding(padding: &str) {
+    let h = make_padded(padding, "null");
+    let original = padding_of(h);
+    assert!(!original.is_null(), "the file's padding must be loaded");
+    let expected_pad: serde_json::Value = match serde_json::from_str(padding) {
+        Ok(v) => v,
+        Err(e) => panic!("{}", e),
+    };
+    assert_eq!(original, expected_pad);
+
+    // tokenizers_encode, specials on and off
+    assert_eq!(plain_ids(h, b"hello world", 1), vec![3, 1, 2, 4]);
+    assert_eq!(padding_of(h), original);
+    assert_eq!(plain_ids(h, b"hello world", 0), vec![1, 2]);
+    assert_eq!(padding_of(h), original);
+
+    // tokenizers_encode_batch: 3 unpadded rows of different lengths
+    let (st, ids) = plain_batch(h, &PAD_TEXTS, 1);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![3, 1, 2, 1, 2, 4], vec![3, 1, 4], vec![3, 2, 2, 2, 2, 2, 4]]);
+    assert_eq!(padding_of(h), original);
+    let (st, ids) = plain_batch(h, &PAD_TEXTS, 0);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![1, 2, 1, 2], vec![1], vec![2, 2, 2, 2, 2]]);
+    assert_eq!(padding_of(h), original);
+
+    // tokenizers_encode_batch_truncated, max_length 4 (truncated) and 0 (untruncated)
+    let (st, ids, _) = trunc_batch(h, &PAD_TEXTS, 1, 4);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![3, 1, 2, 4], vec![3, 1, 4], vec![3, 2, 2, 4]]);
+    assert_eq!(padding_of(h), original);
+    let (st, ids, _) = trunc_batch(h, &PAD_TEXTS, 0, 4);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![1, 2, 1, 2], vec![1], vec![2, 2, 2, 2]]);
+    assert_eq!(padding_of(h), original);
+    let (st, ids, _) = trunc_batch(h, &PAD_TEXTS, 1, 0);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![3, 1, 2, 1, 2, 4], vec![3, 1, 4], vec![3, 2, 2, 2, 2, 2, 4]]);
+    assert_eq!(padding_of(h), original);
+    let (st, ids, _) = trunc_batch(h, &PAD_TEXTS, 0, 0);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![1, 2, 1, 2], vec![1], vec![2, 2, 2, 2, 2]]);
+    assert_eq!(padding_of(h), original);
+
+    // Error paths (invalid UTF-8 in a batch / single text) leave the padding in place.
+    let bad: [&[u8]; 3] = [b"hello", &[0x68, 0xFF, 0x69], b"world"];
+    let (st, _) = plain_batch(h, &bad, 1);
+    assert_eq!(st, TOKENIZERS_ERR_INVALID_UTF8);
+    assert_eq!(padding_of(h), original);
+    let (st, _, all_empty) = trunc_batch(h, &bad, 1, 4);
+    assert_eq!(st, TOKENIZERS_ERR_INVALID_UTF8);
+    assert!(all_empty);
+    assert_eq!(padding_of(h), original);
+    let (st, r) = encode(h, &[0xFF], 1);
+    assert_eq!(st, TOKENIZERS_ERR_INVALID_UTF8);
+    assert!(is_empty(&r));
+    assert_eq!(padding_of(h), original);
+
+    // Still unpadded after the failures.
+    assert_eq!(plain_ids(h, b"hello world", 1), vec![3, 1, 2, 4]);
+    tokenizers_free(h);
+}
+
+// P1: padding {"Fixed": 16}
+#[test]
+fn no_padding_fixed() {
+    check_no_padding(PAD_FIXED16);
+}
+
+// P2: padding BatchLongest, pad_to_multiple_of 8
+#[test]
+fn no_padding_batch_longest() {
+    check_no_padding(PAD_LONGEST8);
+}
+
+// P3: padding off, the file's truncation still on for encode/encode_batch, and both configs
+// come back after a truncated call that overrides the truncation.
+#[test]
+fn no_padding_keeps_file_truncation() {
+    let h = make_padded(PAD_FIXED16, TRUNC3);
+    let original = padding_of(h);
+    let text: &[u8] = b"hello world hello world";
+    assert_eq!(plain_ids(h, text, 1), vec![3, 1, 4]);
+    let (st, ids) = plain_batch(h, &[text], 1);
+    assert_eq!(st, TOKENIZERS_OK);
+    assert_eq!(ids, vec![vec![3, 1, 4]]);
+    let (st, ids, _) = trunc_batch(h, &[text], 1, 6);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids, vec![vec![3, 1, 2, 1, 2, 4]]);
+    assert_eq!(padding_of(h), original);
+    assert_eq!(plain_ids(h, text, 1), vec![3, 1, 4]);
+    tokenizers_free(h);
+}
+
+// P4: the drop guard restores padding and truncation when the encode unwinds (the panic path
+// that guard_status catches at the boundary).
+#[test]
+fn config_restore_on_panic() {
+    let h = make_padded(PAD_FIXED16, TRUNC3);
+    let original = padding_of(h);
+    let wrapper = unsafe { &mut *h };
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let mut guard = ConfigRestore::without_padding(&mut wrapper.tokenizer);
+        guard.saved_truncation = Some(guard.tokenizer.get_truncation().cloned());
+        let _ = set_truncation(guard.tokenizer, None);
+        assert!(guard.tokenizer.get_padding().is_none());
+        assert!(guard.tokenizer.get_truncation().is_none());
+        panic!("forced panic inside encode");
+    }));
+    assert!(r.is_err());
+    assert_eq!(padding_of(h), original);
+    assert_eq!(plain_ids(h, b"hello world hello world", 1), vec![3, 1, 4]);
+    tokenizers_free(h);
+}
+
+// P5: the real all-MiniLM-L6-v2 tokenizer.json (padding Fixed 128). Python no_padding():
+// "Where is the blacksmith?" with specials -> [101, 2073, 2003, 1996, 20987, 1029, 102].
+#[test]
+fn no_padding_minilm() {
+    let path = r"D:\Game Dev\Pipelines-UE\.pipelines-dev\models\reference\all-MiniLM-L6-v2\tokenizer.json";
+    let json = match std::fs::read(path) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("SKIPPED no_padding_minilm: cannot read {}: {}", path, e);
+            return;
+        }
+    };
+    let h = tokenizers_new_from_str(json.as_ptr(), json.len());
+    assert!(!h.is_null(), "{}", last_error());
+    let original = padding_of(h);
+    assert!(!original.is_null(), "MiniLM's tokenizer.json has a padding block");
+    let expected: Vec<u32> = vec![101, 2073, 2003, 1996, 20987, 1029, 102];
+    assert_eq!(plain_ids(h, b"Where is the blacksmith?", 1), expected);
+    let (st, ids) = plain_batch(h, &[&b"Where is the blacksmith?"[..], &b"Hi"[..]], 1);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids[0], expected);
+    assert!(ids[1].len() < expected.len());
+    let (st, ids, _) = trunc_batch(h, &[&b"Where is the blacksmith?"[..]], 1, 0);
+    assert_eq!(st, TOKENIZERS_OK, "{}", last_error());
+    assert_eq!(ids[0], expected);
+    assert_eq!(padding_of(h), original);
+    tokenizers_free(h);
+}
